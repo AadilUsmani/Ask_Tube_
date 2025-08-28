@@ -1,0 +1,40 @@
+services:
+  - type: web
+    name: youtube-rag-assistant
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: AZURE_OPENAI_API_KEY
+        sync: false
+      - key: AZURE_OPENAI_ENDPOINT
+        sync: false
+      - key: AZURE_OPENAI_API_VERSION
+        value: 2024-08-01-preview
+      - key: AZURE_OPENAI_DEPLOYMENT
+        value: gpt-4o-mini
+      - key: AZURE_EMBEDDING_DEPLOYMENT
+        value: text-embedding-3-small
+      - key: PINECONE_API_KEY
+        sync: false
+      - key: PINECONE_ENV
+        value: gcp-starter
+      - key: PINECONE_INDEX
+        value: youtube-rag
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: WEATHERSTACK_API_KEY
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: LLM_TEMPERATURE
+        value: 0.0
+      - key: CHUNK_SIZE
+        value: 1000
+      - key: CHUNK_OVERLAP
+        value: 120
+      - key: SUMMARIZE_MAX_CHARS
+        value: 10000
