@@ -34,11 +34,9 @@ from langchain.prompts import PromptTemplate
 from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
 from pytube import YouTube
 import tempfile
-import os
 # new deps
 import yt_dlp
 import whisper
-import tempfile
 
 # LangChain vectorstore wrapper for Pinecone
 from langchain_community.vectorstores import Pinecone as LC_Pinecone
@@ -182,7 +180,6 @@ def transcribe_with_whisper(video_url: str) -> str:
     cookies_content = os.getenv("YOUTUBE_COOKIES_FILE")
     if cookies_content:
         # Create temporary cookies file from environment variable content
-        import tempfile
         temp_cookies_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
         temp_cookies_file.write(cookies_content)
         temp_cookies_file.close()
@@ -220,41 +217,18 @@ def transcribe_with_whisper(video_url: str) -> str:
 def load_split_chunks(video_url: str) -> Tuple[List[Document], str]:
     # Try to use cookies for YouTube loader
     cookies_content = os.getenv("YOUTUBE_COOKIES_FILE")
+    docs: List[Document] = []  # Initialize docs variable
     
     try:
-        if cookies_content:
-            # Create temporary cookies file from environment variable content
-            import tempfile
-            temp_cookies_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
-            temp_cookies_file.write(cookies_content)
-            temp_cookies_file.close()
-            
-            # Use cookies with YouTube loader
-            loader = SafeYoutubeLoader.from_youtube_url(
-                video_url, 
-                add_video_info=False,
-                cookies=temp_cookies_file.name
-            )
-            logger.info("Using cookies with YouTube loader from environment variable (temp file: %s)", temp_cookies_file.name)
-        else:
-            # Fallback to default loader
-            loader = SafeYoutubeLoader.from_youtube_url(video_url, add_video_info=False)
-            logger.info("Using default YouTube loader (no cookies)")
+        # Try YouTube loader first (no cookies needed here)
+        loader = SafeYoutubeLoader.from_youtube_url(video_url, add_video_info=False)
+        logger.info("Using YouTube loader")
         
-        docs: List[Document] = []
         raw = loader.load()
         if raw:
             docs = raw if isinstance(raw, list) else [raw]
     except Exception as e:
         logger.warning("YoutubeLoader failed for %s, will try direct API: %s", video_url, e)
-    finally:
-        # Clean up temporary cookies file if it was created
-        if 'temp_cookies_file' in locals():
-            try:
-                os.unlink(temp_cookies_file.name)
-                logger.debug("Cleaned up temporary cookies file: %s", temp_cookies_file.name)
-            except Exception as e:
-                logger.debug("Failed to clean up temporary cookies file: %s", e)
 
     # ✅ fallback to youtube_transcript_api if loader failed
     if not docs:
@@ -270,12 +244,17 @@ def load_split_chunks(video_url: str) -> Tuple[List[Document], str]:
             docs = [Document(page_content=raw_text, metadata={"source": video_url})]
         else:
             raise RuntimeError(f"Could not load transcript for {video_url}")
+    
+    # Validate docs is not empty before processing
+    if not docs:
+        raise RuntimeError(f"Could not load transcript for {video_url} - all methods failed")
+    
     # coerce non-Document
-    if not isinstance(docs[0], Document):
+    if docs and len(docs) > 0 and not isinstance(docs[0], Document):
         combined = ""
         if isinstance(docs, str):
             combined = docs
-        elif isinstance(docs, list) and isinstance(docs[0], dict) and "text" in docs[0]:
+        elif isinstance(docs, list) and len(docs) > 0 and isinstance(docs[0], dict) and "text" in docs[0]:
             combined = "\n\n".join(p.get("text", "") for p in docs)
         else:
             combined = "\n\n".join(getattr(d, "page_content", str(d)) for d in docs)
@@ -292,7 +271,8 @@ def load_split_chunks(video_url: str) -> Tuple[List[Document], str]:
     # title fallback
     title = None
     try:
-        title = docs[0].metadata.get("title")
+        if docs and len(docs) > 0:
+            title = docs[0].metadata.get("title")
     except Exception:
         title = None
     if not title:
@@ -410,7 +390,7 @@ def clean_all_chunks_for_download(video_url: str) -> str:
         cleaned_parts.append(cleaned_text)
 
     full_transcript = "\n\n".join(cleaned_parts)
-    cache_entry["last_processed_time"] = datetime.datetime.utcnow().isoformat()
+    cache_entry["last_processed_time"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     title = cache_entry.get("title", f"Video: {extract_video_id(video_url)}")
     header = (
         "CLEANED TRANSCRIPT\n"
@@ -444,7 +424,7 @@ def append_chat_message(video_url: str, session_id: str, role: str, content: str
     cache = ensure_video_cached(video_url)
     sessions = cache.setdefault("chat_sessions", {})
     hist = sessions.setdefault(session_id, [])
-    hist.append({"role": role, "content": content, "ts": datetime.datetime.utcnow().isoformat()})
+    hist.append({"role": role, "content": content, "ts": datetime.datetime.now(datetime.timezone.utc).isoformat()})
     # trim to keep tokens reasonable
     MAX_MSGS = 200
     if len(hist) > MAX_MSGS:
