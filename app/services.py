@@ -33,6 +33,7 @@ from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
 from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
 from pytube import YouTube
+import os
 import tempfile
 # new deps
 import yt_dlp
