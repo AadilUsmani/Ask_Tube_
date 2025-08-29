@@ -32,6 +32,14 @@ class SummarizeRequest(BaseModel):
 class CheckGrammarRequest(BaseModel):
     query: str
 
+@app.get("/debug-env")
+def debug_env():
+    import os
+    return {
+        "youtube_cookies_file": os.getenv("YOUTUBE_COOKIES_FILE"),
+        "cookies_file_exists": os.path.exists(os.getenv("YOUTUBE_COOKIES_FILE", "")) if os.getenv("YOUTUBE_COOKIES_FILE") else False,
+        "all_env_vars": {k: v for k, v in os.environ.items() if "YOUTUBE" in k or "COOKIE" in k}
+    }
 @app.get("/health")
 def health():
     return {"status": "ok"}
