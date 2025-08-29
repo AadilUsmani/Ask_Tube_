@@ -201,7 +201,8 @@ def transcribe_with_whisper(video_url: str) -> str:
         return (result.get("text") or "").strip()
     except Exception as e:
         logger.error("Whisper/YT-DLP failed for %s: %s", video_url, e)
-        return ""
+        # Don't return empty string - let the caller handle the exception
+        raise RuntimeError(f"Whisper/YT-DLP transcription failed: {e}")
     finally:
         # Clean up temporary cookies file if it was created
         if 'temp_cookies_file' in locals():
@@ -215,39 +216,56 @@ def transcribe_with_whisper(video_url: str) -> str:
 # Low-level loader & chunking
 # ---------------------------
 def load_split_chunks(video_url: str) -> Tuple[List[Document], str]:
-    # Try to use cookies for YouTube loader
     cookies_content = os.getenv("YOUTUBE_COOKIES_FILE")
     docs: List[Document] = []  # Initialize docs variable
     
-    try:
-        # Try YouTube loader first (no cookies needed here)
-        loader = SafeYoutubeLoader.from_youtube_url(video_url, add_video_info=False)
-        logger.info("Using YouTube loader")
-        
-        raw = loader.load()
-        if raw:
-            docs = raw if isinstance(raw, list) else [raw]
-    except Exception as e:
-        logger.warning("YoutubeLoader failed for %s, will try direct API: %s", video_url, e)
-
-    # ✅ fallback to youtube_transcript_api if loader failed
-    if not docs:
-        vid = extract_video_id(video_url)
-        raw_text = fetch_youtube_transcript(vid)
-        if raw_text:
-            docs = [Document(page_content=raw_text, metadata={"source": video_url})]
-
-    # ✅ final fallback to Whisper if everything else failed
-    if not docs:
-        raw_text = transcribe_with_whisper(video_url)
-        if raw_text:
-            docs = [Document(page_content=raw_text, metadata={"source": video_url})]
-        else:
-            raise RuntimeError(f"Could not load transcript for {video_url}")
+    # Strategy: Try methods in order of speed, with cookies as fallback
     
-    # Validate docs is not empty before processing
+    # Method 1: YouTube Loader (fastest, no cookies)
     if not docs:
-        raise RuntimeError(f"Could not load transcript for {video_url} - all methods failed")
+        try:
+            loader = SafeYoutubeLoader.from_youtube_url(video_url, add_video_info=False)
+            logger.info("Trying YouTube loader (no cookies)")
+            raw = loader.load()
+            if raw:
+                docs = raw if isinstance(raw, list) else [raw]
+                logger.info("YouTube loader succeeded")
+        except Exception as e:
+            logger.warning("YoutubeLoader failed: %s", e)
+
+    # Method 2: Direct Transcript API (medium speed, no cookies)
+    if not docs:
+        try:
+            vid = extract_video_id(video_url)
+            logger.info("Trying YouTube Transcript API (no cookies)")
+            raw_text = fetch_youtube_transcript(vid)
+            if raw_text:
+                docs = [Document(page_content=raw_text, metadata={"source": video_url})]
+                logger.info("YouTube Transcript API succeeded")
+        except Exception as e:
+            logger.warning("YouTube Transcript API failed: %s", e)
+
+    # Method 3: Whisper + yt-dlp (slowest, WITH cookies for authentication)
+    if not docs:
+        try:
+            logger.info("Trying Whisper + yt-dlp (with cookies for authentication)")
+            raw_text = transcribe_with_whisper(video_url)
+            if raw_text:
+                docs = [Document(page_content=raw_text, metadata={"source": video_url})]
+                logger.info("Whisper + yt-dlp succeeded")
+            else:
+                logger.error("Whisper + yt-dlp returned empty text")
+        except Exception as e:
+            logger.error("Whisper + yt-dlp failed: %s", e)
+    
+    # Final validation
+    if not docs:
+        error_msg = f"All transcript methods failed for {video_url}"
+        if cookies_content:
+            error_msg += " (including authenticated yt-dlp fallback)"
+        else:
+            error_msg += " (no cookies available for authentication)"
+        raise RuntimeError(error_msg)
     
     # coerce non-Document
     if docs and len(docs) > 0 and not isinstance(docs[0], Document):
