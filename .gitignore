@@ -213,6 +213,11 @@ cache/
 # Deployment guides (local reference only)
 DEPLOYMENT.md
 
+# YouTube authentication files
+youtube_cookies.txt
+youtube_cookies_template.txt
+YOUTUBE_AUTH_SETUP.md
+
 # Render specific
 .render-buildlogs/
 

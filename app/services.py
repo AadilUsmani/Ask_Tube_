@@ -132,6 +132,9 @@ class SafeYoutubeLoader(YoutubeLoader):
 def fetch_youtube_transcript(video_id: str, lang_codes=None) -> Optional[str]:
     """Robust transcript fetch using list_transcripts() API."""
     lang_codes = lang_codes or ["en", "en-US", "en-GB"]
+    
+    # Note: YouTubeTranscriptApi doesn't support cookies directly
+    # We'll rely on yt-dlp with cookies for authenticated access
     try:
         listing = YouTubeTranscriptApi.list_transcripts(video_id)
 
@@ -165,6 +168,8 @@ def transcribe_with_whisper(video_url: str) -> str:
     """Download audio via yt-dlp (robust) and transcribe with Whisper."""
     tmpdir = tempfile.mkdtemp()
     outtmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
+    
+    # Add cookie support for YouTube authentication
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
@@ -172,6 +177,14 @@ def transcribe_with_whisper(video_url: str) -> str:
         "noplaylist": True,
         "nocheckcertificate": True,
     }
+    
+    # Add cookies if available
+    cookies_file = os.getenv("YOUTUBE_COOKIES_FILE")
+    if cookies_file and os.path.exists(cookies_file):
+        ydl_opts["cookiefile"] = cookies_file
+        logger.info("Using cookies file: %s", cookies_file)
+    else:
+        logger.info("No cookies file found, using default yt-dlp options")
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=True)
@@ -192,9 +205,24 @@ def transcribe_with_whisper(video_url: str) -> str:
 # Low-level loader & chunking
 # ---------------------------
 def load_split_chunks(video_url: str) -> Tuple[List[Document], str]:
-    loader = SafeYoutubeLoader.from_youtube_url(video_url, add_video_info=False)
-    docs: List[Document] = []
+    # Try to use cookies for YouTube loader
+    cookies_file = os.getenv("YOUTUBE_COOKIES_FILE")
+    
     try:
+        if cookies_file and os.path.exists(cookies_file):
+            # Use cookies with YouTube loader
+            loader = SafeYoutubeLoader.from_youtube_url(
+                video_url, 
+                add_video_info=False,
+                cookies=cookies_file
+            )
+            logger.info("Using cookies with YouTube loader: %s", cookies_file)
+        else:
+            # Fallback to default loader
+            loader = SafeYoutubeLoader.from_youtube_url(video_url, add_video_info=False)
+            logger.info("Using default YouTube loader (no cookies)")
+        
+        docs: List[Document] = []
         raw = loader.load()
         if raw:
             docs = raw if isinstance(raw, list) else [raw]
