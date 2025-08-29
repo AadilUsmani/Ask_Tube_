@@ -179,12 +179,17 @@ def transcribe_with_whisper(video_url: str) -> str:
     }
     
     # Add cookies if available
-    cookies_file = os.getenv("YOUTUBE_COOKIES_FILE")
-    if cookies_file and os.path.exists(cookies_file):
-        ydl_opts["cookiefile"] = cookies_file
-        logger.info("Using cookies file: %s", cookies_file)
+    cookies_content = os.getenv("YOUTUBE_COOKIES_FILE")
+    if cookies_content:
+        # Create temporary cookies file from environment variable content
+        import tempfile
+        temp_cookies_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
+        temp_cookies_file.write(cookies_content)
+        temp_cookies_file.close()
+        ydl_opts["cookiefile"] = temp_cookies_file.name
+        logger.info("Using cookies from environment variable (temp file: %s)", temp_cookies_file.name)
     else:
-        logger.info("No cookies file found, using default yt-dlp options")
+        logger.info("No cookies found in environment variable, using default yt-dlp options")
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=True)
@@ -200,23 +205,37 @@ def transcribe_with_whisper(video_url: str) -> str:
     except Exception as e:
         logger.error("Whisper/YT-DLP failed for %s: %s", video_url, e)
         return ""
+    finally:
+        # Clean up temporary cookies file if it was created
+        if 'temp_cookies_file' in locals():
+            try:
+                os.unlink(temp_cookies_file.name)
+                logger.debug("Cleaned up temporary cookies file: %s", temp_cookies_file.name)
+            except Exception as e:
+                logger.debug("Failed to clean up temporary cookies file: %s", e)
 
 # ---------------------------
 # Low-level loader & chunking
 # ---------------------------
 def load_split_chunks(video_url: str) -> Tuple[List[Document], str]:
     # Try to use cookies for YouTube loader
-    cookies_file = os.getenv("YOUTUBE_COOKIES_FILE")
+    cookies_content = os.getenv("YOUTUBE_COOKIES_FILE")
     
     try:
-        if cookies_file and os.path.exists(cookies_file):
+        if cookies_content:
+            # Create temporary cookies file from environment variable content
+            import tempfile
+            temp_cookies_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
+            temp_cookies_file.write(cookies_content)
+            temp_cookies_file.close()
+            
             # Use cookies with YouTube loader
             loader = SafeYoutubeLoader.from_youtube_url(
                 video_url, 
                 add_video_info=False,
-                cookies=cookies_file
+                cookies=temp_cookies_file.name
             )
-            logger.info("Using cookies with YouTube loader: %s", cookies_file)
+            logger.info("Using cookies with YouTube loader from environment variable (temp file: %s)", temp_cookies_file.name)
         else:
             # Fallback to default loader
             loader = SafeYoutubeLoader.from_youtube_url(video_url, add_video_info=False)
@@ -228,6 +247,14 @@ def load_split_chunks(video_url: str) -> Tuple[List[Document], str]:
             docs = raw if isinstance(raw, list) else [raw]
     except Exception as e:
         logger.warning("YoutubeLoader failed for %s, will try direct API: %s", video_url, e)
+    finally:
+        # Clean up temporary cookies file if it was created
+        if 'temp_cookies_file' in locals():
+            try:
+                os.unlink(temp_cookies_file.name)
+                logger.debug("Cleaned up temporary cookies file: %s", temp_cookies_file.name)
+            except Exception as e:
+                logger.debug("Failed to clean up temporary cookies file: %s", e)
 
     # ✅ fallback to youtube_transcript_api if loader failed
     if not docs:
