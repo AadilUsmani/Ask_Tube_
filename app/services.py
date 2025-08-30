@@ -216,13 +216,18 @@ def fetch_youtube_api_transcript(video_id: str) -> Optional[str]:
             if auth_type == "oauth":
                 # Create proper credentials object from token string
                 from google.oauth2.credentials import Credentials
-                creds = Credentials(
-                    token=credentials,
-                    token_uri="https://oauth2.googleapis.com/token",
-                    client_id=os.getenv("YOUTUBE_CLIENT_ID"),
-                    client_secret=os.getenv("YOUTUBE_CLIENT_SECRET")
-                )
-                youtube = build('youtube', 'v3', credentials=creds)
+                try:
+                    creds = Credentials(
+                        token=credentials,
+                        token_uri="https://oauth2.googleapis.com/token",
+                        client_id=os.getenv("YOUTUBE_CLIENT_ID"),
+                        client_secret=os.getenv("YOUTUBE_CLIENT_SECRET")
+                    )
+                    youtube = build('youtube', 'v3', credentials=creds)
+                    logger.info("Successfully created OAuth2 credentials from access token")
+                except Exception as oauth_error:
+                    logger.error("Failed to create OAuth2 credentials: %s", oauth_error)
+                    continue
             elif auth_type == "refresh":
                 # Generate new access token from refresh token
                 from google.auth.transport.requests import Request
@@ -237,11 +242,13 @@ def fetch_youtube_api_transcript(video_id: str) -> Optional[str]:
                 )
                 
                 # Refresh the token
-                creds.refresh(Request())
-                youtube = build('youtube', 'v3', credentials=creds)
-                
-                # Store the new access token for future use
-                logger.info("Generated new OAuth2 access token")
+                try:
+                    creds.refresh(Request())
+                    youtube = build('youtube', 'v3', credentials=creds)
+                    logger.info("Successfully generated new OAuth2 access token from refresh token")
+                except Exception as refresh_error:
+                    logger.error("Failed to refresh OAuth2 token: %s", refresh_error)
+                    continue
                 
             else:  # apikey
                 youtube = build('youtube', 'v3', developerKey=credentials)
