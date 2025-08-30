@@ -39,20 +39,38 @@ import tempfile
 import yt_dlp
 import whisper
 
+# YouTube API imports
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+
 # LangChain vectorstore wrapper for Pinecone
 from langchain_community.vectorstores import Pinecone as LC_Pinecone
 import pinecone
 
 # Local helpers & LLM factories (assume app/llm.py and app/utils.py exist)
-from .llm import get_answer_llm, get_cleaner_llm, get_embedder
-from .utils import (
-    md5,
-    truncate_to_words,
-    decide_word_limit_from_query,
-    extract_video_id,
-    chunk_id_for,
-    extract_text_from_invoke_result,
-)
+try:
+    from .llm import get_answer_llm, get_cleaner_llm, get_embedder
+    from .utils import (
+        md5,
+        truncate_to_words,
+        decide_word_limit_from_query,
+        extract_video_id,
+        chunk_id_for,
+        extract_text_from_invoke_result,
+    )
+except ImportError:
+    # Fallback for when running as standalone script
+    from llm import get_answer_llm, get_cleaner_llm, get_embedder
+    from utils import (
+        md5,
+        truncate_to_words,
+        decide_word_limit_from_query,
+        extract_video_id,
+        chunk_id_for,
+        extract_text_from_invoke_result,
+    )
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -163,12 +181,153 @@ def fetch_youtube_transcript(video_id: str, lang_codes=None) -> Optional[str]:
         return None
 
 
+def fetch_youtube_api_transcript(video_id: str) -> Optional[str]:
+    """Fetch transcript using official YouTube Data API v3 with multiple auth methods."""
+    
+    # Try multiple authentication methods
+    auth_methods = []
+    
+    # Method 1: OAuth2 Refresh Token (can generate new access tokens - most reliable)
+    refresh_token = os.getenv("YOUTUBE_REFRESH_TOKEN")
+    client_id = os.getenv("YOUTUBE_CLIENT_ID")
+    client_secret = os.getenv("YOUTUBE_CLIENT_SECRET")
+    if refresh_token and client_id and client_secret:
+        auth_methods.append(("refresh", (refresh_token, client_id, client_secret)))
+    
+    # Method 2: OAuth2 Access Token (if available, but less reliable)
+    oauth_token = os.getenv("YOUTUBE_OAUTH_TOKEN")
+    if oauth_token:
+        auth_methods.append(("oauth", oauth_token))
+    
+    # Method 3: API Key (limited but works for basic operations)
+    api_key = os.getenv("YOUTUBE_API_KEY")
+    if api_key:
+        auth_methods.append(("apikey", api_key))
+    
+    if not auth_methods:
+        logger.warning("No YouTube API authentication methods configured")
+        return None
+    
+    # Try each authentication method
+    for auth_type, credentials in auth_methods:
+        try:
+            logger.info("Trying YouTube API with %s authentication", auth_type)
+            
+            if auth_type == "oauth":
+                # Create proper credentials object from token string
+                from google.oauth2.credentials import Credentials
+                creds = Credentials(
+                    token=credentials,
+                    token_uri="https://oauth2.googleapis.com/token",
+                    client_id=os.getenv("YOUTUBE_CLIENT_ID"),
+                    client_secret=os.getenv("YOUTUBE_CLIENT_SECRET")
+                )
+                youtube = build('youtube', 'v3', credentials=creds)
+            elif auth_type == "refresh":
+                # Generate new access token from refresh token
+                from google.auth.transport.requests import Request
+                from google.oauth2.credentials import Credentials
+                
+                creds = Credentials(
+                    None,  # No access token initially
+                    refresh_token=credentials[0],
+                    token_uri="https://oauth2.googleapis.com/token",
+                    client_id=credentials[1],
+                    client_secret=credentials[2]
+                )
+                
+                # Refresh the token
+                creds.refresh(Request())
+                youtube = build('youtube', 'v3', credentials=creds)
+                
+                # Store the new access token for future use
+                logger.info("Generated new OAuth2 access token")
+                
+            else:  # apikey
+                youtube = build('youtube', 'v3', developerKey=credentials)
+            
+            # First, get video details to check if captions are available
+            video_response = youtube.videos().list(
+                part='snippet,contentDetails',
+                id=video_id
+            ).execute()
+            
+            if not video_response.get('items'):
+                logger.warning("Video not found via YouTube API: %s", video_id)
+                continue
+            
+            video_info = video_response['items'][0]
+            logger.info("Video found via YouTube API: %s", video_info['snippet']['title'])
+            
+            # Get available captions
+            captions_response = youtube.captions().list(
+                part='snippet',
+                videoId=video_id
+            ).execute()
+            
+            if not captions_response.get('items'):
+                logger.info("No captions available via YouTube API for %s", video_id)
+                continue
+            
+            # Find English captions (prefer manually created)
+            english_captions = []
+            for caption in captions_response['items']:
+                if caption['snippet']['language'] in ['en', 'en-US', 'en-GB']:
+                    english_captions.append(caption)
+            
+            if not english_captions:
+                logger.info("No English captions found via YouTube API for %s", video_id)
+                continue
+            
+            # Sort by manually created first, then auto-generated
+            english_captions.sort(key=lambda x: x['snippet']['trackKind'] == 'ASR')
+            
+            # Download the first available English caption
+            caption_id = english_captions[0]['id']
+            caption_response = youtube.captions().download(
+                id=caption_id,
+                tfmt='srt'
+            ).execute()
+            
+            # Parse SRT format to extract text
+            caption_text = caption_response.decode('utf-8')
+            lines = caption_text.split('\n')
+            
+            # Extract text lines (every 3rd line starting from line 2)
+            text_lines = []
+            for i in range(2, len(lines), 4):
+                if i < len(lines) and lines[i].strip():
+                    text_lines.append(lines[i].strip())
+            
+            transcript = ' '.join(text_lines)
+            logger.info("Successfully fetched transcript via YouTube API (%s auth) for %s (%d chars)", 
+                       auth_type, video_id, len(transcript))
+            return transcript
+            
+        except HttpError as e:
+            if e.resp.status == 401:
+                logger.warning("YouTube API authentication failed with %s method: %s", auth_type, e)
+                continue
+            elif e.resp.status == 403:
+                logger.warning("YouTube API quota exceeded or access denied with %s method: %s", auth_type, e)
+                continue
+            else:
+                logger.error("YouTube API HTTP error with %s method: %s", auth_type, e)
+                continue
+        except Exception as e:
+            logger.error("YouTube API failed with %s method: %s", auth_type, e)
+            continue
+    
+    logger.warning("All YouTube API authentication methods failed for %s", video_id)
+    return None
+
+
 def transcribe_with_whisper(video_url: str) -> str:
     """Download audio via yt-dlp (robust) and transcribe with Whisper."""
     tmpdir = tempfile.mkdtemp()
     outtmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
     
-    # Add cookie support for YouTube authentication
+    # Add cookie support for YouTube authentication with rotation
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
@@ -177,8 +336,20 @@ def transcribe_with_whisper(video_url: str) -> str:
         "nocheckcertificate": True,
     }
     
-    # Add cookies if available
-    cookies_content = os.getenv("YOUTUBE_COOKIES_FILE")
+    # Try multiple cookie sets for redundancy
+    cookie_sets = [
+        os.getenv("YOUTUBE_COOKIES_FILE"),           # Primary cookies
+        os.getenv("YOUTUBE_COOKIES_FILE_2"),         # Backup set 1
+        os.getenv("YOUTUBE_COOKIES_FILE_3"),         # Backup set 2
+    ]
+    
+    cookies_content = None
+    for i, cookie_set in enumerate(cookie_sets):
+        if cookie_set:
+            cookies_content = cookie_set
+            logger.info("Using cookie set %d for yt-dlp", i + 1)
+            break
+    
     if cookies_content:
         # Create temporary cookies file from environment variable content
         temp_cookies_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
@@ -187,7 +358,8 @@ def transcribe_with_whisper(video_url: str) -> str:
         ydl_opts["cookiefile"] = temp_cookies_file.name
         logger.info("Using cookies from environment variable (temp file: %s)", temp_cookies_file.name)
     else:
-        logger.info("No cookies found in environment variable, using default yt-dlp options")
+        logger.info("No cookies found in any environment variable, using default yt-dlp options")
+    
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=True)
@@ -213,16 +385,89 @@ def transcribe_with_whisper(video_url: str) -> str:
             except Exception as e:
                 logger.debug("Failed to clean up temporary cookies file: %s", e)
 
+
+def transcribe_with_whisper_no_cookies(video_url: str) -> str:
+    """Download audio via yt-dlp WITHOUT cookies (last resort fallback)."""
+    tmpdir = tempfile.mkdtemp()
+    outtmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
+    
+    # yt-dlp options optimized for no-cookie access
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": outtmpl,
+        "quiet": True,
+        "noplaylist": True,
+        "nocheckcertificate": True,
+        # Anti-bot measures for no-cookie access
+        "extractor_retries": 3,
+        "fragment_retries": 3,
+        "retries": 3,
+        "sleep_interval": 1,
+        "max_sleep_interval": 5,
+        # User agent rotation
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+    }
+    
+    logger.info("Attempting yt-dlp download without cookies (may trigger bot detection)")
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=True)
+            audio_path = ydl.prepare_filename(info)
+
+        model = whisper.load_model("base")
+        result = model.transcribe(audio_path)
+        try:
+            os.remove(audio_path)
+        except Exception:
+            pass
+        return (result.get("text") or "").strip()
+    except Exception as e:
+        logger.error("Whisper/YT-DLP (no cookies) failed for %s: %s", video_url, e)
+        raise RuntimeError(f"Whisper/YT-DLP (no cookies) transcription failed: {e}")
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
 # ---------------------------
 # Low-level loader & chunking
 # ---------------------------
 def load_split_chunks(video_url: str) -> Tuple[List[Document], str]:
-    cookies_content = os.getenv("YOUTUBE_COOKIES_FILE")
+    # Try multiple cookie sets for redundancy
+    cookie_sets = [
+        os.getenv("YOUTUBE_COOKIES_FILE"),           # Primary cookies
+        os.getenv("YOUTUBE_COOKIES_FILE_2"),         # Backup set 1
+        os.getenv("YOUTUBE_COOKIES_FILE_3"),         # Backup set 2
+    ]
+    
+    cookies_content = None
+    for cookie_set in cookie_sets:
+        if cookie_set:
+            cookies_content = cookie_set
+            break
+    
     docs: List[Document] = []  # Initialize docs variable
     
-    # Strategy: Try methods in order of speed, with cookies as fallback
+    # Strategy: Try methods in order of reliability and speed
     
-    # Method 1: YouTube Loader (fastest, no cookies)
+    # Method 1: YouTube Data API v3 (most reliable, no bot detection)
+    if not docs:
+        try:
+            vid = extract_video_id(video_url)
+            logger.info("Trying YouTube Data API v3 (no bot detection)")
+            raw_text = fetch_youtube_api_transcript(vid)
+            if raw_text:
+                docs = [Document(page_content=raw_text, metadata={"source": video_url})]
+                logger.info("YouTube Data API v3 succeeded")
+        except Exception as e:
+            logger.warning("YouTube Data API v3 failed: %s", e)
+
+    # Method 2: YouTube Loader (fast, no cookies)
     if not docs:
         try:
             loader = SafeYoutubeLoader.from_youtube_url(video_url, add_video_info=False)
@@ -234,7 +479,7 @@ def load_split_chunks(video_url: str) -> Tuple[List[Document], str]:
         except Exception as e:
             logger.warning("YoutubeLoader failed: %s", e)
 
-    # Method 2: Direct Transcript API (medium speed, no cookies)
+    # Method 3: Direct Transcript API (medium speed, no cookies)
     if not docs:
         try:
             vid = extract_video_id(video_url)
@@ -246,10 +491,10 @@ def load_split_chunks(video_url: str) -> Tuple[List[Document], str]:
         except Exception as e:
             logger.warning("YouTube Transcript API failed: %s", e)
 
-    # Method 3: Whisper + yt-dlp (slowest, WITH cookies for authentication)
+    # Method 4: Whisper + yt-dlp (WITH cookies if available)
     if not docs:
         try:
-            logger.info("Trying Whisper + yt-dlp (with cookies for authentication)")
+            logger.info("Trying Whisper + yt-dlp (with cookies if available)")
             raw_text = transcribe_with_whisper(video_url)
             if raw_text:
                 docs = [Document(page_content=raw_text, metadata={"source": video_url})]
@@ -259,13 +504,23 @@ def load_split_chunks(video_url: str) -> Tuple[List[Document], str]:
         except Exception as e:
             logger.error("Whisper + yt-dlp failed: %s", e)
     
+    # Method 5: Whisper + yt-dlp WITHOUT cookies (last resort)
+    if not docs:
+        try:
+            logger.info("Trying Whisper + yt-dlp WITHOUT cookies (last resort)")
+            raw_text = transcribe_with_whisper_no_cookies(video_url)
+            if raw_text:
+                docs = [Document(page_content=raw_text, metadata={"source": video_url})]
+                logger.info("Whisper + yt-dlp (no cookies) succeeded")
+            else:
+                logger.error("Whisper + yt-dlp (no cookies) returned empty text")
+        except Exception as e:
+            logger.error("Whisper + yt-dlp (no cookies) failed: %s", e)
+    
     # Final validation
     if not docs:
         error_msg = f"All transcript methods failed for {video_url}"
-        if cookies_content:
-            error_msg += " (including authenticated yt-dlp fallback)"
-        else:
-            error_msg += " (no cookies available for authentication)"
+        error_msg += " (including YouTube API, YouTube loader, transcript API, yt-dlp with cookies, and yt-dlp without cookies)"
         raise RuntimeError(error_msg)
     
     # coerce non-Document
